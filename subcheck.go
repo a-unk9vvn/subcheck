@@ -1,156 +1,155 @@
 package main
 
 import (
-	"bufio"
-	"flag"
-	"fmt"
-	"net/http"
-	"os"
-	"strings"
+ "bufio"
+ "flag"
+ "fmt"
+ "net/http"
+ "os"
+ "strings"
+ "sync"
+ "time"
 )
 
+var statusColors = map[string]string{
+ "2xx":   "\033[32m", // Green
+ "3xx":   "\033[34m", // Blue
+ "4xx":   "\033[35m", // Purple
+ "reset": "\033[0m",  // Reset color
+}
 
-var defaultSubdomains = []string{
-	"www", "api", "mail", "blog", "dev", "test", "shop", "ftp", "support",
-	"admin", "m", "dashboard", "static", "cms", "staging", "cdn", "secure", "beta",
-	"docs", "help", "assets", "media", "portal", "gateway", "office", "download",
-	"mobile", "search", "cloud", "services", "pay", "webmail", "smtp", "vpn", "app",
-	"auth", "login", "logout", "register", "upload", "images", "backup", "status",
-	"chat", "my", "devops", "partners", "analytics", "monitoring", "graph", "reporting",
-	"proxy", "archive", "cache", "test1", "test2", "api-v1", "api-v2", "resources",
+// CheckProtocol determines whether a URL uses HTTPS or HTTP
+func CheckProtocol(url string) string {
+ // Try HTTPS first
+ httpsURL := "https://" + strings.TrimPrefix(url, "http://")
+ resp, err := http.Get(httpsURL)
+ if err == nil && resp.StatusCode < 400 {
+  // If HTTPS works, return it
+  fmt.Printf("Target %s is using HTTPS.\n", url)
+  return httpsURL
+ }
+ // Fall back to HTTP if HTTPS fails
+ fmt.Printf("Target %s is using HTTP.\n", url)
+ return "http://" + strings.TrimPrefix(url, "http://")
+}
+
+// CheckDirectory checks the status of a directory on the target URL
+func CheckDirectory(url string, directory string, outputChan chan<- string, semaphore chan struct{}) {
+ defer func() { <-semaphore }()
+
+ // Construct the full URL for the directory
+ fullURL := fmt.Sprintf("%s/%s", strings.TrimRight(url, "/"), directory)
+ client := &http.Client{Timeout: 5 * time.Second}
+
+ // Send GET request to the directory
+ resp, err := client.Get(fullURL)
+ if err != nil {
+  outputChan <- fmt.Sprintf("Error accessing %s: %v", fullURL, err)
+  return
+ }
+ defer resp.Body.Close()
+
+ // Determine the status code family and assign colors
+ statusCode := resp.StatusCode
+ statusFamily := fmt.Sprintf("%dxx", statusCode/100)
+ color := statusColors["reset"]
+
+ // Apply color based on status family
+ if c, ok := statusColors[statusFamily]; ok {
+  color = c
+ }
+
+ // Adjust color for 404 specifically (directory not found)
+ if statusCode == 404 {
+  color = "\033[35m" // Purple for 404
+ }
+
+ // Send the result to the channel
+ outputChan <- fmt.Sprintf("%s%s - Status: %d%s", color, fullURL, statusCode, statusColors["reset"])
+}
+
+// PrintHelp displays the help message
+func PrintHelp() {
+ fmt.Println("Usage: go run main.go [OPTIONS]")
+ fmt.Println("Options:")
+ fmt.Println("  -u <url>     : Target URL (e.g., example.com)")
+ fmt.Println("  -l <file>    : File containing directories to check")
+ fmt.Println("  -o <file>    : Output file (optional)")
+ fmt.Println("  -t <threads> : Number of threads to use (default: 50)")
+ fmt.Println("  -h           : Show this help message")
 }
 
 func main() {
-	
-	fmt.Println("  SSSSS  U   U  BBBBB   CCCC  H   H  EEEEE  CCCC  K   K")
-	fmt.Println(" S        U   U  B    B C      H   H  E      C      K  K")
-	fmt.Println("  SSS     U   U  BBBBB  C      HHHHH  EEEE   C      KKK")
-	fmt.Println("     S    U   U  B    B C      H   H  E      C      K  K")
-	fmt.Println(" SSSSS    UUUU   BBBBB   CCCC  H   H  EEEEE  CCCC  K   K")
-	fmt.Println()
+ // Define flags
+ urlPtr := flag.String("u", "", "Target URL (e.g., example.com)")
+ listPtr := flag.String("l", "", "File containing directories to check")
+ outputPtr := flag.String("o", "", "Output file (optional)")
+ threadPtr := flag.Int("t", 50, "Number of threads to use (default: 50)")
+ helpPtr := flag.Bool("h", false, "Show help message")
+ flag.Parse()
 
-	
-	listFile := flag.String("l", "", "Path to the file containing subdomains list (optional).")
-	outputFile := flag.String("o", "", "Path to the output file (optional).")
-	baseURL := flag.String("u", "", "Base URL to scan for subdomains (required).")
-	flag.Parse()
+ // Show help if -h is specified or insufficient arguments are provided
+ if *helpPtr || len(os.Args) < 3 {
+  PrintHelp()
+  return
+ }
 
+ if *urlPtr == "" || *listPtr == "" {
+  fmt.Println("Error: -u (URL) and -l (directory list) are required.")
+  PrintHelp()
+  return
+ }
 
-	if *baseURL == "" {
-		fmt.Println("Please provide a URL. Usage: -u https://example.com")
-		return
-	}
+ // Determine protocol if not specified
+ finalURL := CheckProtocol(*urlPtr)
 
-	
-	subdomains := defaultSubdomains
-	if *listFile != "" {
-		var err error
-		subdomains, err = readSubdomainsFromFile(*listFile)
-		if err != nil {
-			fmt.Printf("Error reading subdomains list: %v\n", err)
-			return
-		}
-	}
+ // Open the directory list file
+ file, err := os.Open(*listPtr)
+ if err != nil {
+  fmt.Printf("Error opening list file: %v\n", err)
+  return
+ }
+ defer file.Close()
 
-	
-	trimmedURL := strings.TrimPrefix(strings.TrimPrefix(*baseURL, "http://"), "https://")
-	parts := strings.Split(trimmedURL, "/")
-	domain := parts[0]
+ // Prepare for output
+ var outputFile *os.File
+ if *outputPtr != "" {
+  outputFile, err = os.Create(*outputPtr)
+  if err != nil {
+   fmt.Printf("Error creating output file: %v\n", err)
+   return
+  }
+  defer outputFile.Close()
+ }
 
-	
-	var results []string
-	for _, subdomain := range subdomains {
-		fullURL := fmt.Sprintf("https://%s.%s", subdomain, domain)
-		status := checkSubdomainStatus(fullURL)
-		results = append(results, status)
-	}
+ // Channel for collecting results
+ outputChan := make(chan string, 1000) // Buffered channel for efficiency
+ var wg sync.WaitGroup
+ semaphore := make(chan struct{}, *threadPtr) // Limit number of concurrent threads
 
-	
-	if *outputFile != "" {
-		err := writeResultsToFile(*outputFile, results)
-		if err != nil {
-			fmt.Printf("Error writing to output file: %v\n", err)
-			return
-		}
-		fmt.Printf("Results saved to %s\n", *outputFile)
-	} else {
-		// نمایش نتایج در کنسول
-		for _, result := range results {
-			fmt.Println(result)
-		}
-	}
-}
+ // Read directories from the file and start checking them
+ scanner := bufio.NewScanner(file)
+ for scanner.Scan() {
+  directory := scanner.Text()
+  wg.Add(1)
+  semaphore <- struct{}{} // Acquire semaphore
+  go func(dir string) {
+   defer wg.Done()
+   CheckDirectory(finalURL, dir, outputChan, semaphore)
+  }(directory)
+ }
+	// Start a goroutine to collect and print results immediately
+ go func() {
+  for result := range outputChan {
+   if outputFile != nil {
+    outputFile.WriteString(result + "\n")
+   } else {
+    fmt.Println(result) // Print results to terminal immediately
+   }
+  }
+ }()
 
-
-func readSubdomainsFromFile(path string) ([]string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var subdomains []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			subdomains = append(subdomains, line)
-		}
-	}
-	return subdomains, scanner.Err()
-}
-
-
-func checkSubdomainStatus(url string) string {
-	resp, err := http.Get(url)
-	if err != nil {
-		
-		return fmt.Sprintf("%s: Not Found", url)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == 404 {
-		// اگر وضعیت 404 برگشت، "Not Found" را نمایش می‌دهیم
-		return fmt.Sprintf("%s: Not Found (404)", url)
-	}
-
-	
-	return colorizeStatus(url, resp.StatusCode, fmt.Sprintf("%d", resp.StatusCode))
-}
-
-
-func colorizeStatus(url string, statusCode int, status string) string {
-	var colorCode string
-	switch {
-	case statusCode >= 200 && statusCode < 300:
-		colorCode = "\033[32m"
-	case statusCode >= 300 && statusCode < 400:
-		colorCode = "\033[34m" 
-	case statusCode >= 400 && statusCode < 500:
-		colorCode = "\033[35m" 
-	case statusCode >= 500 && statusCode < 600:
-		colorCode = "\033[31m" 
-	default:
-		colorCode = "\033[0m" 
-	}
-
-	return fmt.Sprintf("%s%s: %s\033[0m", colorCode, url, status)
-}
-
-
-func writeResultsToFile(path string, results []string) error {
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	writer := bufio.NewWriter(file)
-	for _, result := range results {
-		_, err := writer.WriteString(result + "\n")
-		if err != nil {
-			return err
-		}
-	}
-	return writer.Flush()
+ // Wait for all checks to complete
+ wg.Wait()
+ close(outputChan)
 }
